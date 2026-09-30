@@ -20,7 +20,26 @@ db.exec(`
   );
 `);
 
-// NOTE: no CREATE INDEX on email — GET /users/:email does a full table scan
+// NOTE: no index on email by default — GET /users/:id does a full table scan
 // on purpose (Phase 3 adds the index and we compare before/after).
+
+let indexEnabled = false;
+
+// Phase 3: toggle the covering index for the LOWER(email) lookup.
+// With expression index: index seek (~0.01ms). Without: full scan of 10k rows.
+export function setIndexEnabled(enabled) {
+  if (enabled === indexEnabled) return indexEnabled;
+  if (enabled) {
+    db.exec("CREATE INDEX IF NOT EXISTS idx_users_lower_email ON users (LOWER(email))");
+  } else {
+    db.exec("DROP INDEX IF EXISTS idx_users_lower_email");
+  }
+  indexEnabled = enabled;
+  return indexEnabled;
+}
+
+export function isIndexEnabled() {
+  return indexEnabled;
+}
 
 export default db;

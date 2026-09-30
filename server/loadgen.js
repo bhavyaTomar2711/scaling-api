@@ -107,6 +107,8 @@ export function stopLoad() {
   workers = [];
   currentTarget = 0;
   startedAt = 0;
-  workerStats.clear();
+  // NOTE: workerStats is intentionally NOT cleared here — the last reported
+  // window (which may still be mid-flight when stopped) stays readable so
+  // benchmark code can collect final numbers. It gets cleared on next start.
   return true;
 }

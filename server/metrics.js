@@ -19,6 +19,11 @@ export function recordRequest(latencyMs, isError) {
   if (isError) totalErrors++;
 }
 
+// Clear the rolling window (used between benchmark levels for clean readings)
+export function resetWindowMetrics() {
+  samples = [];
+}
+
 export function incConnections() {
   activeConnections++;
 }

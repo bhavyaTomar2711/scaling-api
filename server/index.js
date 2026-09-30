@@ -1,21 +1,22 @@
 import express from "express";
 import http from "node:http";
 import os from "node:os";
-import db from "./db.js";
-import { seedUsers, getUserById } from "./seed.js";
+import db, { setIndexEnabled, isIndexEnabled } from "./db.js";
+import { seedUsers, getUserById, getQueryPlan, getAndResetQueryStats } from "./seed.js";
 import {
   recordRequest,
   incConnections,
   decConnections,
   getMetrics,
   statusFor,
+  resetWindowMetrics,
 } from "./metrics.js";
 import { startLoad, stopLoad, isRunning, getLoadStats, recordChildStats } from "./loadgen.js";
 
 const PORT = process.env.API_PORT || 4000;
 
-// Seed on boot (10k rows — big enough to be realistic, fast to load)
-const seedInfo = seedUsers(10000);
+// Seed on boot (100k rows — makes the full-scan vs index difference dramatic)
+const seedInfo = seedUsers(100000);
 
 const app = express();
 app.disable("x-powered-by");
@@ -45,6 +46,54 @@ app.get("/users/:id", (req, res) => {
 app.get("/metrics", (req, res) => {
   res.json({ ...getMetrics(), status: statusFor(getMetrics()) });
 });
+
+// ---- Phase 3: Database indexing ----
+
+// Toggle the index on/off (the FIX switch)
+app.post("/index/:state", (req, res) => {
+  const state = req.params.state === "on";
+  setIndexEnabled(state);
+  res.json({ ok: true, indexEnabled: isIndexEnabled(), ...getQueryPlan() });
+});
+
+// Query plan proof: full scan vs index seek
+app.get("/index/plan", (req, res) => {
+  res.json(getQueryPlan());
+});
+
+// Phase 3 benchmark: run 1k/2k/3k at current index state, return per-level stats
+app.post("/phase3/benchmark", async (req, res) => {
+  const levels = [1000, 2000, 3000];
+  const results = [];
+  for (const level of levels) {
+    // reset aggregate request counters for clean per-level readings
+    resetWindowMetrics();
+    startLoad(level, PORT);
+    await sleep(7000);
+    stopLoad();
+    await sleep(1000); // let the last completions land
+    const stats = getLoadStats();
+    const m = getMetrics();
+    results.push({
+      targetRps: level,
+      achievedRps: stats.achievedRps || 0,
+      avgLatency: stats.avgLatency || 0,
+      p99Latency: stats.p99Latency || 0,
+      errorRate: Math.round((stats.errorRate || 0) * 100) / 100,
+      serverCpu: m.cpuUsage,
+    });
+    await sleep(1500);
+  }
+  res.json({
+    indexEnabled: isIndexEnabled(),
+    plan: getQueryPlan(),
+    results,
+  });
+});
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
 
 // ---- Load generator control ----
 app.post("/load/start", (req, res) => {
@@ -98,6 +147,8 @@ setInterval(() => {
       errorRate: getLoadStats().errorRate ?? 0,
       inFlight: getLoadStats().inFlight ?? 0,
     },
+    // Phase 3: DB query performance + plan proof
+    db: { ...getAndResetQueryStats(), ...getQueryPlan() },
   });
   for (const client of sseClients) {
     client.write(`data: ${payload}\n\n`);

@@ -12,6 +12,15 @@ import {
   ResponsiveContainer,
 } from "recharts";
 
+type BenchmarkResult = {
+  targetRps: number;
+  achievedRps: number;
+  avgLatency: number;
+  p99Latency: number;
+  errorRate: number;
+  serverCpu: number;
+};
+
 type Metrics = {
   timestamp: string;
   requestsPerSec: number;
@@ -27,6 +36,13 @@ type Metrics = {
   totalErrors: number;
   status: "healthy" | "degrading" | "critical";
   load: { running: boolean; target: number; sent: number; completed: number; errors: number };
+  db: {
+    avgQueryMs: number;
+    queriesPerSec: number;
+    indexEnabled: boolean;
+    usingIndex: boolean;
+    detail: string;
+  };
 };
 
 type Point = {
@@ -47,9 +63,14 @@ function fmt(n: number) {
 export default function Home() {
   const [metrics, setMetrics] = useState<Metrics | null>(null);
   const [points, setPoints] = useState<Point[]>([]);
-  const [target, setTarget] = useState(5000);
+  const [target, setTarget] = useState(1000);
   const [custom, setCustom] = useState("");
   const [connected, setConnected] = useState(false);
+  const [benchRunning, setBenchRunning] = useState(false);
+  const [bench, setBench] = useState<{
+    before?: BenchmarkResult[];
+    after?: BenchmarkResult[];
+  }>({});
   const pointsRef = useRef<Point[]>([]);
 
   useEffect(() => {
@@ -83,6 +104,38 @@ export default function Home() {
 
   const stopLoad = useCallback(async () => {
     await fetch("/api/load/stop", { method: "POST" });
+  }, []);
+
+  // Custom input always becomes the live target (fixes the stale-target bug)
+  const applyCustom = useCallback(() => {
+    const v = Number(custom);
+    if (v >= 1) {
+      setTarget(v);
+      setCustom("");
+    }
+  }, [custom]);
+
+  const toggleIndex = useCallback(async (on: boolean) => {
+    await fetch(`/api/index/${on ? "on" : "off"}`, { method: "POST" });
+  }, []);
+
+  const runBenchmark = useCallback(async () => {
+    setBenchRunning(true);
+    try {
+      // BEFORE: index off
+      await fetch("/api/index/off", { method: "POST" });
+      const beforeRes = await fetch("/api/phase3/benchmark", { method: "POST" });
+      const before = (await beforeRes.json()).results;
+      setBench((b) => ({ ...b, before }));
+
+      // AFTER: index on
+      await fetch("/api/index/on", { method: "POST" });
+      const afterRes = await fetch("/api/phase3/benchmark", { method: "POST" });
+      const after = (await afterRes.json()).results;
+      setBench((b) => ({ ...b, after }));
+    } finally {
+      setBenchRunning(false);
+    }
   }, []);
 
   const status = metrics?.status ?? "healthy";
@@ -132,18 +185,20 @@ export default function Home() {
           ))}
           <input
             value={custom}
-            onChange={(e) => setCustom(e.target.value.replace(/\D/g, ""))}
+            onChange={(e) => {
+              const v = e.target.value.replace(/\D/g, "");
+              setCustom(v);
+              if (v !== "" && Number(v) >= 1) setTarget(Number(v)); // live-apply
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") applyCustom();
+            }}
             placeholder="custom"
             className="w-24 px-3 py-1.5 rounded-md bg-zinc-800 border border-zinc-700 text-sm"
           />
-          {custom && (
-            <button
-              onClick={() => setTarget(Number(custom))}
-              className="px-3 py-1.5 rounded-md border border-zinc-600 text-sm text-zinc-300"
-            >
-              set
-            </button>
-          )}
+          <span className="text-xs text-zinc-500">
+            firing at {fmt(target)} req/s
+          </span>
 
           <div className="flex-1" />
 
@@ -209,6 +264,92 @@ export default function Home() {
             </div>
           </div>
         ))}
+      </section>
+
+      {/* Phase 3: Database indexing panel */}
+      <section className="rounded-xl border border-zinc-800 bg-zinc-900 p-5 mb-6">
+        <div className="flex flex-wrap items-center gap-4 mb-4">
+          <h2 className="text-sm font-bold text-zinc-300">🛠 Fix #1 — Database Indexing</h2>
+          <span
+            className={`text-xs px-2 py-0.5 rounded ${
+              metrics?.db.indexEnabled
+                ? "bg-green-500/10 text-green-400"
+                : "bg-zinc-700/50 text-zinc-400"
+            }`}
+          >
+            {metrics?.db.indexEnabled ? "✅ INDEX ON" : "⬜ index off (full table scan)"}
+          </span>
+          <div className="flex gap-2">
+            <button
+              onClick={() => toggleIndex(false)}
+              className={`px-3 py-1 rounded text-xs ${
+                !metrics?.db.indexEnabled
+                  ? "bg-zinc-700 text-zinc-200"
+                  : "border border-zinc-700 text-zinc-500 hover:border-zinc-500"
+              }`}
+            >
+              index OFF
+            </button>
+            <button
+              onClick={() => toggleIndex(true)}
+              className={`px-3 py-1 rounded text-xs ${
+                metrics?.db.indexEnabled
+                  ? "bg-green-600 text-white"
+                  : "border border-green-700 text-green-400 hover:border-green-500"
+              }`}
+            >
+              index ON
+            </button>
+          </div>
+          <div className="flex-1" />
+          <button
+            onClick={runBenchmark}
+            disabled={benchRunning || metrics?.load.running}
+            className="px-4 py-1.5 rounded bg-sky-600 hover:bg-sky-500 disabled:opacity-40 text-sm font-bold"
+          >
+            {benchRunning ? "running before/after (~1 min)..." : "▶ Run Before/After Benchmark (1k/2k/3k)"}
+          </button>
+        </div>
+
+        <div className="text-xs text-zinc-500 mb-3 font-mono">
+          Query plan: {metrics?.db.detail ?? "—"} · avg query: {metrics?.db.avgQueryMs ?? 0} ms ·{" "}
+          {metrics?.db.queriesPerSec ?? 0} queries/s
+        </div>
+
+        {bench.before && bench.after && (
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="text-zinc-500 border-b border-zinc-800">
+                <th className="text-left py-1.5">Load</th>
+                <th className="text-right py-1.5">Before (scan) latency</th>
+                <th className="text-right py-1.5">After (index) latency</th>
+                <th className="text-right py-1.5">Improvement</th>
+                <th className="text-right py-1.5">Before rps</th>
+                <th className="text-right py-1.5">After rps</th>
+              </tr>
+            </thead>
+            <tbody>
+              {bench.before.map((b, i) => {
+                const a = bench.after?.[i];
+                if (!a) return null;
+                const improvement =
+                  b.avgLatency > 0
+                    ? Math.round((1 - a.avgLatency / b.avgLatency) * 100)
+                    : 0;
+                return (
+                  <tr key={b.targetRps} className="border-b border-zinc-800/50">
+                    <td className="py-1.5 text-zinc-300">{b.targetRps}/s</td>
+                    <td className="py-1.5 text-right text-red-400">{b.avgLatency.toFixed(0)} ms</td>
+                    <td className="py-1.5 text-right text-green-400">{a.avgLatency.toFixed(0)} ms</td>
+                    <td className="py-1.5 text-right font-bold text-sky-400">{improvement}% ↓</td>
+                    <td className="py-1.5 text-right text-zinc-500">{b.achievedRps}</td>
+                    <td className="py-1.5 text-right text-zinc-300">{a.achievedRps}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
       </section>
 
       {/* Charts */}
@@ -313,10 +454,9 @@ export default function Home() {
       </section>
 
       <footer className="mt-8 text-xs text-zinc-600">
-        Phase 1 — unoptimized baseline: full table scans on every lookup, no
-        cache, no pooling. Levels are scaled for laptop hardware (raw loopback
-        caps ~7.5k req/s); the degradation curve and breaking-point
-        experiments are identical, just at laptop scale.
+        Phase 3 — same dumb query, with and without an expression index on
+        LOWER(email). Toggle the index and watch avg query time and the
+        breaking point shift. Levels are laptop-scaled.
       </footer>
     </div>
   );
