@@ -1,0 +1,8 @@
+PHASE 1:
+
+Req/s = 510-630
+avg latency = 13.2
+p99 latency = 31.9
+error = 0%
+
+

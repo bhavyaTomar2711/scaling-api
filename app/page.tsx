@@ -1,69 +1,323 @@
-import Image from "next/image";
+"use client";
+
+import { useEffect, useRef, useState, useCallback } from "react";
+import {
+  LineChart,
+  Line,
+  XAxis,
+  YAxis,
+  Tooltip,
+  Legend,
+  CartesianGrid,
+  ResponsiveContainer,
+} from "recharts";
+
+type Metrics = {
+  timestamp: string;
+  requestsPerSec: number;
+  avgLatency: number;
+  p50Latency: number;
+  p99Latency: number;
+  errorRate: number;
+  cpuUsage: number;
+  memoryUsage: number;
+  rssMemory: number;
+  activeConnections: number;
+  totalRequests: number;
+  totalErrors: number;
+  status: "healthy" | "degrading" | "critical";
+  load: { running: boolean; target: number; sent: number; completed: number; errors: number };
+};
+
+type Point = {
+  t: number;
+  rps: number;
+  latency: number;
+  p99: number;
+  errors: number;
+  cpu: number;
+};
+
+const LOAD_LEVELS = [1000, 2000, 3000];
+
+function fmt(n: number) {
+  return n.toLocaleString();
+}
 
 export default function Home() {
+  const [metrics, setMetrics] = useState<Metrics | null>(null);
+  const [points, setPoints] = useState<Point[]>([]);
+  const [target, setTarget] = useState(5000);
+  const [custom, setCustom] = useState("");
+  const [connected, setConnected] = useState(false);
+  const pointsRef = useRef<Point[]>([]);
+
+  useEffect(() => {
+    const es = new EventSource("/api/events");
+    es.onopen = () => setConnected(true);
+    es.onerror = () => setConnected(false);
+    es.onmessage = (e) => {
+      const m: Metrics = JSON.parse(e.data);
+      setMetrics(m);
+      const p: Point = {
+        t: Date.now(),
+        rps: m.requestsPerSec,
+        latency: m.avgLatency,
+        p99: m.p99Latency,
+        errors: m.errorRate,
+        cpu: m.cpuUsage,
+      };
+      pointsRef.current = [...pointsRef.current.slice(-119), p]; // keep last ~60s
+      setPoints(pointsRef.current);
+    };
+    return () => es.close();
+  }, []);
+
+  const startLoad = useCallback(async (rps: number) => {
+    await fetch("/api/load/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ targetRps: rps }),
+    });
+  }, []);
+
+  const stopLoad = useCallback(async () => {
+    await fetch("/api/load/stop", { method: "POST" });
+  }, []);
+
+  const status = metrics?.status ?? "healthy";
+  const statusColor =
+    status === "critical"
+      ? "text-red-500"
+      : status === "degrading"
+        ? "text-yellow-400"
+        : "text-green-500";
+  const statusDot =
+    status === "critical" ? "🔴" : status === "degrading" ? "🟡" : "🟢";
+
+  const fireIntensity = metrics?.load.running
+    ? Math.min(5, 1 + Math.floor((metrics.load.target ?? 0) / 800))
+    : 0;
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert h-5 w-[100px]"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the{" "}
-            <code className="rounded bg-black/[.06] px-1.5 py-0.5 font-mono text-[0.9em] dark:bg-white/[.08]">
-              page.tsx
-            </code>{" "}
-            file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
+    <div className="min-h-screen bg-zinc-950 text-zinc-100 font-mono p-6">
+      <header className="flex items-center justify-between mb-6">
+        <h1 className="text-2xl font-bold">🔥 API Load Simulator</h1>
+        <div className="flex items-center gap-3 text-sm">
+          <span className={connected ? "text-green-500" : "text-red-500"}>
+            {connected ? "● live" : "○ disconnected"}
+          </span>
+          <span className={statusColor}>
+            {statusDot} {status.toUpperCase()}
+          </span>
         </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
+      </header>
+
+      {/* Control panel */}
+      <section className="rounded-xl border border-zinc-800 bg-zinc-900 p-5 mb-6">
+        <div className="flex flex-wrap items-center gap-3">
+          <span className="text-zinc-400 text-sm">Load level:</span>
+          {LOAD_LEVELS.map((lvl) => (
+            <button
+              key={lvl}
+              onClick={() => setTarget(lvl)}
+              className={`px-4 py-1.5 rounded-md border text-sm transition-colors ${
+                target === lvl
+                  ? "border-orange-500 bg-orange-500/10 text-orange-400"
+                  : "border-zinc-700 text-zinc-400 hover:border-zinc-500"
+              }`}
+            >
+              {lvl / 1000}k req/s
+            </button>
+          ))}
+          <input
+            value={custom}
+            onChange={(e) => setCustom(e.target.value.replace(/\D/g, ""))}
+            placeholder="custom"
+            className="w-24 px-3 py-1.5 rounded-md bg-zinc-800 border border-zinc-700 text-sm"
+          />
+          {custom && (
+            <button
+              onClick={() => setTarget(Number(custom))}
+              className="px-3 py-1.5 rounded-md border border-zinc-600 text-sm text-zinc-300"
+            >
+              set
+            </button>
+          )}
+
+          <div className="flex-1" />
+
+          <button
+            onClick={() => startLoad(target)}
+            disabled={metrics?.load.running}
+            className="px-6 py-2 rounded-md bg-orange-600 hover:bg-orange-500 disabled:opacity-40 font-bold text-lg transition-all"
+            style={{
+              transform: `scale(${1 + fireIntensity * 0.04})`,
+              boxShadow: fireIntensity > 0 ? `0 0 ${fireIntensity * 8}px rgba(249,115,22,.5)` : "none",
+            }}
           >
-            <Image
-              className="dark:invert h-[14px] w-4"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={14}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
+            {"🔥".repeat(Math.max(1, fireIntensity))} START LOAD
+          </button>
+          <button
+            onClick={stopLoad}
+            disabled={!metrics?.load.running}
+            className="px-6 py-2 rounded-md bg-zinc-700 hover:bg-zinc-600 disabled:opacity-40 font-bold"
           >
-            Documentation
-          </a>
+            STOP
+          </button>
         </div>
-      </main>
+      </section>
+
+      {/* Metric tiles */}
+      <section className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+        {[
+          {
+            label: "Target",
+            value: metrics?.load.running ? `${fmt(metrics.load.target)}/s` : "—",
+          },
+          { label: "Actual req/s", value: fmt(metrics?.requestsPerSec ?? 0) },
+          {
+            label: "Avg latency",
+            value: `${metrics?.avgLatency ?? 0} ms`,
+            warn: (metrics?.avgLatency ?? 0) > 200,
+          },
+          {
+            label: "P99 latency",
+            value: `${metrics?.p99Latency ?? 0} ms`,
+            warn: (metrics?.p99Latency ?? 0) > 1000,
+          },
+          {
+            label: "Error rate",
+            value: `${metrics?.errorRate ?? 0}%`,
+            warn: (metrics?.errorRate ?? 0) > 1,
+          },
+          { label: "CPU", value: `${metrics?.cpuUsage ?? 0}%` },
+          { label: "Memory", value: `${metrics?.memoryUsage ?? 0} MB` },
+          { label: "Total reqs", value: fmt(metrics?.totalRequests ?? 0) },
+        ].map((tile) => (
+          <div
+            key={tile.label}
+            className="rounded-xl border border-zinc-800 bg-zinc-900 p-4"
+          >
+            <div className="text-xs text-zinc-500 mb-1">{tile.label}</div>
+            <div
+              className={`text-xl font-bold ${
+                tile.warn ? "text-red-400" : "text-zinc-100"
+              }`}
+            >
+              {tile.value}
+            </div>
+          </div>
+        ))}
+      </section>
+
+      {/* Charts */}
+      <section className="grid md:grid-cols-2 gap-6">
+        <div className="rounded-xl border border-zinc-800 bg-zinc-900 p-4">
+          <h2 className="text-sm text-zinc-400 mb-3">
+            Requests/sec (last ~60s)
+          </h2>
+          <ResponsiveContainer width="100%" height={220}>
+            <LineChart data={points}>
+              <CartesianGrid stroke="#27272a" />
+              <XAxis dataKey="t" hide />
+              <YAxis stroke="#71717a" width={60} />
+              <Tooltip
+                contentStyle={{ background: "#18181b", border: "#27272a" }}
+                labelFormatter={() => ""}
+              />
+              <Line
+                type="monotone"
+                dataKey="rps"
+                stroke="#f97316"
+                dot={false}
+                strokeWidth={2}
+              />
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+
+        <div className="rounded-xl border border-zinc-800 bg-zinc-900 p-4">
+          <h2 className="text-sm text-zinc-400 mb-3">Latency (ms)</h2>
+          <ResponsiveContainer width="100%" height={220}>
+            <LineChart data={points}>
+              <CartesianGrid stroke="#27272a" />
+              <XAxis dataKey="t" hide />
+              <YAxis stroke="#71717a" width={60} />
+              <Tooltip
+                contentStyle={{ background: "#18181b", border: "#27272a" }}
+                labelFormatter={() => ""}
+              />
+              <Legend />
+              <Line
+                type="monotone"
+                dataKey="latency"
+                name="avg"
+                stroke="#38bdf8"
+                dot={false}
+              />
+              <Line
+                type="monotone"
+                dataKey="p99"
+                name="p99"
+                stroke="#ef4444"
+                dot={false}
+              />
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+
+        <div className="rounded-xl border border-zinc-800 bg-zinc-900 p-4">
+          <h2 className="text-sm text-zinc-400 mb-3">Error rate (%)</h2>
+          <ResponsiveContainer width="100%" height={220}>
+            <LineChart data={points}>
+              <CartesianGrid stroke="#27272a" />
+              <XAxis dataKey="t" hide />
+              <YAxis stroke="#71717a" width={60} />
+              <Tooltip
+                contentStyle={{ background: "#18181b", border: "#27272a" }}
+                labelFormatter={() => ""}
+              />
+              <Line
+                type="monotone"
+                dataKey="errors"
+                stroke="#ef4444"
+                dot={false}
+                strokeWidth={2}
+              />
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+
+        <div className="rounded-xl border border-zinc-800 bg-zinc-900 p-4">
+          <h2 className="text-sm text-zinc-400 mb-3">CPU (%)</h2>
+          <ResponsiveContainer width="100%" height={220}>
+            <LineChart data={points}>
+              <CartesianGrid stroke="#27272a" />
+              <XAxis dataKey="t" hide />
+              <YAxis stroke="#71717a" width={60} domain={[0, 100]} />
+              <Tooltip
+                contentStyle={{ background: "#18181b", border: "#27272a" }}
+                labelFormatter={() => ""}
+              />
+              <Line
+                type="monotone"
+                dataKey="cpu"
+                stroke="#a3e635"
+                dot={false}
+                strokeWidth={2}
+              />
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+      </section>
+
+      <footer className="mt-8 text-xs text-zinc-600">
+        Phase 1 — unoptimized baseline: full table scans on every lookup, no
+        cache, no pooling. Levels are scaled for laptop hardware (raw loopback
+        caps ~7.5k req/s); the degradation curve and breaking-point
+        experiments are identical, just at laptop scale.
+      </footer>
     </div>
   );
 }
