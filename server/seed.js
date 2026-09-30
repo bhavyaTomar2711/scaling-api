@@ -59,6 +59,18 @@ export function getUserById(id) {
   };
 }
 
+// Uncached lookup used as the cache-miss path (skips query timing dedup)
+export function lookupUserRaw(id) {
+  const row = getUserStmt.get(`${id}@example.com`);
+  if (!row) return null;
+  return {
+    id: row.id,
+    name: row.name,
+    email: row.email,
+    createdAt: row.created_at,
+  };
+}
+
 // Query plan introspection — proves SCAN vs SEARCH to the dashboard
 export function getQueryPlan() {
   const plan = db
