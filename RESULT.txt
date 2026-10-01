@@ -1,20 +1,22 @@
-PHASE 1:
-
+PHASE 1-2:
 Req/s = 640-710
-avg latency = 13.2
-error = 0%
 
-PHASE 2:
-
-Req/s = 2900-3100
-avg latency = 2.2
-error = 0%
 
 PHASE 3:
+Req/s = 2900-3100
 
+
+PHASE 4:
 Req/s = 3100-3400
-avg latency = 2.2
-error = 0%
+
+
+PHASE 5-6:
+Req/s = 3200-3600
+
+
+PHASE 7:
+Req/s = 9500-10100
+
 
 
 
