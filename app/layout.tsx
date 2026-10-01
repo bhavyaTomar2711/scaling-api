@@ -17,7 +17,11 @@ export const metadata: Metadata = {
   description: "Break it, measure it, fix it — learn system design by experiment",
 };
 
-export default function RootLayout({ children }: LayoutProps<"/">) {
+export default function RootLayout({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
   return (
     <html
       lang="en"

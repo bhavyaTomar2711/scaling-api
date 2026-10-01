@@ -1,12 +1,10 @@
 import express from "express";
 import http from "node:http";
-import os from "node:os";
 import db, { setIndexEnabled, isIndexEnabled } from "./db.js";
 import {
   seedUsers,
   getQueryPlan,
   getAndResetQueryStats,
-  lookupUserRaw,
 } from "./seed.js";
 import {
   getUserCached,
@@ -20,9 +18,20 @@ import {
   decConnections,
   getMetrics,
   statusFor,
-  resetWindowMetrics,
 } from "./metrics.js";
 import { startLoad, stopLoad, isRunning, getLoadStats, recordChildStats } from "./loadgen.js";
+import {
+  queryUser,
+  setPoolEnabled,
+  getPoolStats,
+} from "./pool.js";
+import {
+  clusterState,
+  BALANCER_PORT,
+  getClusterStats,
+  startControlServer,
+  broadcastToWorkers,
+} from "./cluster.js";
 
 const PORT = process.env.API_PORT || 4000;
 
@@ -51,7 +60,8 @@ app.use((req, res, next) => {
 // on misses — a 5-min TTL means ~98%+ hit rate under sustained load).
 app.get("/users/:id", async (req, res) => {
   const id = Number(req.params.id);
-  const { user, cacheHit } = await getUserCached(id, () => lookupUserRaw(id));
+  // Phase 4 cache → Phase 5 pooled connection on the miss path
+  const { user, cacheHit } = await getUserCached(id, () => queryUser(id));
   if (!user) return res.status(404).json({ error: "user not found" });
   res.set("X-Cache", cacheHit ? "HIT" : "MISS");
   res.json(user);
@@ -68,6 +78,9 @@ app.post("/cache/:state", async (req, res) => {
   const state = req.params.state === "on";
   cacheStateEnabled = state;
   setCacheEnabled(state);
+  if (!process.env.WORKER_MODE) {
+    broadcastToWorkers(`/cache/${req.params.state}`);
+  }
   res.json({ ok: true, ...(await getCacheInfo()) });
 });
 
@@ -80,45 +93,20 @@ app.post("/cache/flush", async (req, res) => {
   res.json({ ok: true, ...(await getCacheInfo()) });
 });
 
-// Phase 4 benchmark: 1k/2k/3k at current cache state
-app.post("/phase4/benchmark", async (req, res) => {
-  const levels = [1000, 2000, 3000];
-  const results = [];
-  for (const level of levels) {
-    resetWindowMetrics();
-    startLoad(level, PORT);
-    await sleep(7000);
-    stopLoad();
-    await sleep(1000);
-    const stats = getLoadStats();
-    const m = getMetrics();
-    const cache = await getCacheInfo();
-    results.push({
-      targetRps: level,
-      achievedRps: stats.achievedRps || 0,
-      avgLatency: stats.avgLatency || 0,
-      p99Latency: stats.p99Latency || 0,
-      errorRate: Math.round((stats.errorRate || 0) * 100) / 100,
-      serverCpu: m.cpuUsage,
-      hitRate: cache.hitRate,
-    });
-    await sleep(1500);
+// ---- Phase 5: Connection pooling ----
+
+app.post("/pool/:state", (req, res) => {
+  const state = req.params.state === "on";
+  setPoolEnabled(state);
+  if (!process.env.WORKER_MODE) {
+    broadcastToWorkers(`/pool/${req.params.state}`);
   }
-  res.json({
-    cacheEnabled: cacheStateEnabledSnapshot(),
-    cacheInfo: await getCacheInfo(),
-    results,
-  });
+  res.json({ ok: true, ...getPoolStats() });
 });
 
-function cacheStateEnabledSnapshot() {
-  return getCacheInfoSync();
-}
-
-function getCacheInfoSync() {
-  // snapshot without awaiting redis (good enough for a flag)
-  return cacheStateEnabled;
-}
+app.get("/pool/stats", (req, res) => {
+  res.json(getPoolStats());
+});
 
 let cacheStateEnabled = false;
 let cacheHitsSnapshot = 0;
@@ -135,52 +123,32 @@ setInterval(async () => {
 app.post("/index/:state", (req, res) => {
   const state = req.params.state === "on";
   setIndexEnabled(state);
+  if (!process.env.WORKER_MODE) {
+    broadcastToWorkers(`/index/${req.params.state}`);
+  }
   res.json({ ok: true, indexEnabled: isIndexEnabled(), ...getQueryPlan() });
 });
+
+// ---- Phase 7: Load balancing (scale across CPU cores) ----
+// Cluster control on dedicated port (4199), main process only.
+if (!process.env.WORKER_MODE) {
+  startControlServer();
+}
 
 // Query plan proof: full scan vs index seek
 app.get("/index/plan", (req, res) => {
   res.json(getQueryPlan());
 });
 
-// Phase 3 benchmark: run 1k/2k/3k at current index state, return per-level stats
-app.post("/phase3/benchmark", async (req, res) => {
-  const levels = [1000, 2000, 3000];
-  const results = [];
-  for (const level of levels) {
-    // reset aggregate request counters for clean per-level readings
-    resetWindowMetrics();
-    startLoad(level, PORT);
-    await sleep(7000);
-    stopLoad();
-    await sleep(1000); // let the last completions land
-    const stats = getLoadStats();
-    const m = getMetrics();
-    results.push({
-      targetRps: level,
-      achievedRps: stats.achievedRps || 0,
-      avgLatency: stats.avgLatency || 0,
-      p99Latency: stats.p99Latency || 0,
-      errorRate: Math.round((stats.errorRate || 0) * 100) / 100,
-      serverCpu: m.cpuUsage,
-    });
-    await sleep(1500);
-  }
-  res.json({
-    indexEnabled: isIndexEnabled(),
-    plan: getQueryPlan(),
-    results,
-  });
-});
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
 
 // ---- Load generator control ----
 app.post("/load/start", (req, res) => {
   const { targetRps = 5000 } = req.body || {};
-  const ok = startLoad(Number(targetRps), PORT);
+  // When cluster is ON, hammer the balancer port (4050 → workers);
+  // stats always flow back to the main server (PORT) for the dashboard.
+  const loadPort = clusterState.enabled ? BALANCER_PORT : PORT;
+  const ok = startLoad(Number(targetRps), loadPort, Number(PORT));
   res.json({ ok, running: isRunning(), targetRps });
 });
 
@@ -216,18 +184,38 @@ app.get("/events", (req, res) => {
 
 setInterval(() => {
   const m = getMetrics();
-  const payload = JSON.stringify({
+  const loadStats = getLoadStats();
+  const isLoadActive = loadStats.running || loadStats.achievedRps > 0;
+
+  const rps = isLoadActive ? (loadStats.achievedRps ?? 0) : m.requestsPerSec;
+  const avgLat = isLoadActive ? Math.round((loadStats.avgLatency ?? 0) * 10) / 10 : m.avgLatency;
+  const p50Lat = isLoadActive ? Math.round((loadStats.p50Latency ?? 0) * 10) / 10 : m.p50Latency;
+  const p99Lat = isLoadActive ? Math.round((loadStats.p99Latency ?? 0) * 10) / 10 : m.p99Latency;
+  const errRate = isLoadActive ? Math.round((loadStats.errorRate ?? 0) * 10) / 10 : m.errorRate;
+  const activeConn = isLoadActive ? (loadStats.inFlight ?? 0) : m.activeConnections;
+
+  const combinedMetrics = {
     ...m,
-    status: statusFor(m),
-    load: getLoadStats(),
+    requestsPerSec: rps,
+    avgLatency: avgLat,
+    p50Latency: p50Lat,
+    p99Latency: p99Lat,
+    errorRate: errRate,
+    activeConnections: activeConn,
+  };
+
+  const payload = JSON.stringify({
+    ...combinedMetrics,
+    status: statusFor(combinedMetrics),
+    load: loadStats,
     // Client-observed metrics (what Locust would show) take precedence
     client: {
-      achievedRps: getLoadStats().achievedRps ?? 0,
-      avgLatency: getLoadStats().avgLatency ?? 0,
-      p50Latency: getLoadStats().p50Latency ?? 0,
-      p99Latency: getLoadStats().p99Latency ?? 0,
-      errorRate: getLoadStats().errorRate ?? 0,
-      inFlight: getLoadStats().inFlight ?? 0,
+      achievedRps: loadStats.achievedRps ?? 0,
+      avgLatency: loadStats.avgLatency ?? 0,
+      p50Latency: loadStats.p50Latency ?? 0,
+      p99Latency: loadStats.p99Latency ?? 0,
+      errorRate: loadStats.errorRate ?? 0,
+      inFlight: loadStats.inFlight ?? 0,
     },
     // Phase 3: DB query performance + plan proof
     db: { ...getAndResetQueryStats(), ...getQueryPlan() },
@@ -237,6 +225,10 @@ setInterval(() => {
       hits: cacheHitsSnapshot,
       misses: cacheMissesSnapshot,
     },
+    // Phase 5: connection pool stats
+    pool: getPoolStats(),
+    // Phase 7: cluster stats
+    cluster: getClusterStats(),
   });
   for (const client of sseClients) {
     client.write(`data: ${payload}\n\n`);
@@ -246,13 +238,29 @@ setInterval(() => {
 const server = http.createServer(app);
 server.keepAliveTimeout = 5000;
 server.headersTimeout = 6000;
+// Bind IPv4 explicitly — workers and the balancer talk over 127.0.0.1, and
+// binding :: (all interfaces) invites EADDRINUSE from stale listeners.
+const HOST = "127.0.0.1";
 server.on("connection", (socket) => socket.setNoDelay(true)); // loopback latency fix
 
-server.listen(PORT, () => {
-  console.log(`API on http://localhost:${PORT}`);
-  console.log(
-    seedInfo.seeded
-      ? `Seeded ${seedInfo.count} users.`
-      : `DB already has ${seedInfo.count} users (skipped seeding).`
-  );
+// (Port 4000 is never stopped — cluster balancer uses port 4050 separately)
+
+// Main process on :4000, workers on :4100+. Port 4000 is NEVER stopped.
+server.listen(PORT, HOST, () => {
+  if (process.env.WORKER_MODE) {
+    console.log(`API worker on http://127.0.0.1:${PORT}`);
+  } else {
+    console.log(`API on http://localhost:${PORT}`);
+    console.log(
+      seedInfo.seeded
+        ? `Seeded ${seedInfo.count} users.`
+        : `DB already has ${seedInfo.count} users (skipped seeding).`
+    );
+  }
+});
+
+// If we can't bind our port on startup, exit cleanly.
+server.on("error", (err) => {
+  console.error(`[api :${PORT}] server error:`, err.message);
+  process.exit(1);
 });

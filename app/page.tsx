@@ -2,24 +2,16 @@
 
 import { useEffect, useRef, useState, useCallback } from "react";
 import {
+  AreaChart,
+  Area,
   LineChart,
   Line,
   XAxis,
   YAxis,
   Tooltip,
-  Legend,
   CartesianGrid,
   ResponsiveContainer,
 } from "recharts";
-
-type BenchmarkResult = {
-  targetRps: number;
-  achievedRps: number;
-  avgLatency: number;
-  p99Latency: number;
-  errorRate: number;
-  serverCpu: number;
-};
 
 type Metrics = {
   timestamp: string;
@@ -30,12 +22,11 @@ type Metrics = {
   errorRate: number;
   cpuUsage: number;
   memoryUsage: number;
-  rssMemory: number;
   activeConnections: number;
   totalRequests: number;
   totalErrors: number;
   status: "healthy" | "degrading" | "critical";
-  load: { running: boolean; target: number; sent: number; completed: number; errors: number };
+  load: { running: boolean; target: number };
   db: {
     avgQueryMs: number;
     queriesPerSec: number;
@@ -43,11 +34,9 @@ type Metrics = {
     usingIndex: boolean;
     detail: string;
   };
-  cache: {
-    enabled: boolean;
-    hits: number;
-    misses: number;
-  };
+  cache: { enabled: boolean; hits: number; misses: number };
+  pool: { enabled: boolean; active: number; queued: number; avgWaitMs: number };
+  cluster: { enabled: boolean; workers: number; maxWorkers: number };
 };
 
 type Point = {
@@ -65,43 +54,137 @@ function fmt(n: number) {
   return n.toLocaleString();
 }
 
+/* ---------------- Sliding toggle ---------------- */
+function Toggle({
+  checked,
+  onChange,
+}: {
+  checked: boolean;
+  onChange: (v: boolean) => void;
+}) {
+  return (
+    <button
+      role="switch"
+      aria-checked={checked}
+      onClick={() => onChange(!checked)}
+      className={`relative h-6 w-11 shrink-0 rounded-full transition-colors duration-300 focus:outline-none ${
+        checked ? "bg-emerald-600" : "bg-zinc-700"
+      }`}
+    >
+      <span
+        className={`absolute top-0.5 left-0.5 h-5 w-5 rounded-full bg-white shadow transition-transform duration-300 ${
+          checked ? "translate-x-5" : "translate-x-0"
+        }`}
+      />
+    </button>
+  );
+}
+
+/* ---------------- Fix card: name + toggle + one-liner ---------------- */
+function FixCard({
+  name,
+  oneLinerOn,
+  oneLinerOff,
+  on,
+  onToggle,
+}: {
+  name: string;
+  oneLinerOn: string;
+  oneLinerOff: string;
+  on: boolean;
+  onToggle: (v: boolean) => void;
+}) {
+  return (
+    <div
+      className={`rounded-xl border p-4 transition-colors ${
+        on
+          ? "border-emerald-500/20 bg-emerald-500/[0.03]"
+          : "border-zinc-800/70 bg-[#111113]"
+      }`}
+    >
+      <div className="flex items-center justify-between gap-4">
+        <div className="flex items-center gap-2.5">
+          <span
+            className={`h-1.5 w-1.5 rounded-full transition-colors ${
+              on ? "bg-emerald-400" : "bg-zinc-600"
+            }`}
+          />
+          <h3 className="text-sm font-medium text-zinc-100">{name}</h3>
+        </div>
+        <Toggle checked={on} onChange={onToggle} />
+      </div>
+      <p
+        className={`mt-2.5 font-mono text-xs transition-colors ${
+          on ? "text-emerald-300" : "text-zinc-400"
+        }`}
+      >
+        {on ? oneLinerOn : oneLinerOff}
+      </p>
+    </div>
+  );
+}
+
+const chartTooltip = {
+  contentStyle: {
+    background: "#131316",
+    border: "1px solid #26262a",
+    borderRadius: "8px",
+    fontSize: "12px",
+  },
+  labelStyle: { color: "#71717a" },
+  cursor: { stroke: "#3f3f46", strokeDasharray: "3 3" },
+};
+
+const panel =
+  "rounded-xl border border-zinc-800/70 bg-[#111113]";
+
 export default function Home() {
   const [metrics, setMetrics] = useState<Metrics | null>(null);
   const [points, setPoints] = useState<Point[]>([]);
   const [target, setTarget] = useState(1000);
   const [custom, setCustom] = useState("");
   const [connected, setConnected] = useState(false);
-  const [benchRunning, setBenchRunning] = useState(false);
-  const [bench, setBench] = useState<{
-    before?: BenchmarkResult[];
-    after?: BenchmarkResult[];
-  }>({});
-  const [bench4Running, setBench4Running] = useState(false);
-  const [bench4, setBench4] = useState<{
-    before?: BenchmarkResult[];
-    after?: BenchmarkResult[];
-  }>({});
   const pointsRef = useRef<Point[]>([]);
 
   useEffect(() => {
-    const es = new EventSource("/api/events");
-    es.onopen = () => setConnected(true);
-    es.onerror = () => setConnected(false);
-    es.onmessage = (e) => {
-      const m: Metrics = JSON.parse(e.data);
-      setMetrics(m);
-      const p: Point = {
-        t: Date.now(),
-        rps: m.requestsPerSec,
-        latency: m.avgLatency,
-        p99: m.p99Latency,
-        errors: m.errorRate,
-        cpu: m.cpuUsage,
+    let es: EventSource | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let unmounted = false;
+
+    function connect() {
+      if (unmounted) return;
+      es = new EventSource("/api/events");
+      es.onopen = () => setConnected(true);
+      es.onerror = () => {
+        setConnected(false);
+        // EventSource.CLOSED === 2: the browser gave up (non-200 response).
+        // Auto-reconnect won't happen, so we recreate after a short delay.
+        if (es?.readyState === EventSource.CLOSED && !unmounted) {
+          reconnectTimer = setTimeout(connect, 2000);
+        }
       };
-      pointsRef.current = [...pointsRef.current.slice(-119), p]; // keep last ~60s
-      setPoints(pointsRef.current);
+      es.onmessage = (e) => {
+        const m: Metrics = JSON.parse(e.data);
+        setMetrics(m);
+        const p: Point = {
+          t: Date.now(),
+          rps: m.requestsPerSec,
+          latency: m.avgLatency,
+          p99: m.p99Latency,
+          errors: m.errorRate,
+          cpu: m.cpuUsage,
+        };
+        pointsRef.current = [...pointsRef.current.slice(-119), p];
+        setPoints(pointsRef.current);
+      };
+    }
+
+    connect();
+    return () => {
+      unmounted = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      es?.close();
     };
-    return () => es.close();
   }, []);
 
   const startLoad = useCallback(async (rps: number) => {
@@ -116,7 +199,6 @@ export default function Home() {
     await fetch("/api/load/stop", { method: "POST" });
   }, []);
 
-  // Custom input always becomes the live target (fixes the stale-target bug)
   const applyCustom = useCallback(() => {
     const v = Number(custom);
     if (v >= 1) {
@@ -128,543 +210,290 @@ export default function Home() {
   const toggleIndex = useCallback(async (on: boolean) => {
     await fetch(`/api/index/${on ? "on" : "off"}`, { method: "POST" });
   }, []);
-
   const toggleCache = useCallback(async (on: boolean) => {
     await fetch(`/api/cache/${on ? "on" : "off"}`, { method: "POST" });
   }, []);
-
-  const runPhase4Benchmark = useCallback(async () => {
-    setBench4Running(true);
-    try {
-      // BEFORE: cache off (index on — Phase 3 fix already applied)
-      await fetch("/api/cache/off", { method: "POST" });
-      const beforeRes = await fetch("/api/phase4/benchmark", { method: "POST" });
-      const before = (await beforeRes.json()).results;
-      setBench4((b) => ({ ...b, before }));
-
-      // AFTER: cache on
-      await fetch("/api/cache/on", { method: "POST" });
-      const afterRes = await fetch("/api/phase4/benchmark", { method: "POST" });
-      const after = (await afterRes.json()).results;
-      setBench4((b) => ({ ...b, after }));
-    } finally {
-      setBench4Running(false);
-    }
+  const togglePool = useCallback(async (on: boolean) => {
+    await fetch(`/api/pool/${on ? "on" : "off"}`, { method: "POST" });
   }, []);
-
-  const runBenchmark = useCallback(async () => {
-    setBenchRunning(true);
-    try {
-      // BEFORE: index off
-      await fetch("/api/index/off", { method: "POST" });
-      const beforeRes = await fetch("/api/phase3/benchmark", { method: "POST" });
-      const before = (await beforeRes.json()).results;
-      setBench((b) => ({ ...b, before }));
-
-      // AFTER: index on
-      await fetch("/api/index/on", { method: "POST" });
-      const afterRes = await fetch("/api/phase3/benchmark", { method: "POST" });
-      const after = (await afterRes.json()).results;
-      setBench((b) => ({ ...b, after }));
-    } finally {
-      setBenchRunning(false);
-    }
+  const toggleCluster = useCallback(async (on: boolean) => {
+    await fetch(`/api/cluster/${on ? "on" : "off"}`, { method: "POST" });
+    // cluster takes a few seconds to spawn workers / hand back the port;
+    // the SSE stream reconnects on its own and shows the new state
+    setTimeout(() => {
+      fetch("/api/events").catch(() => {});
+    }, 3000);
   }, []);
 
   const status = metrics?.status ?? "healthy";
-  const statusColor =
-    status === "critical"
-      ? "text-red-500"
-      : status === "degrading"
-        ? "text-yellow-400"
-        : "text-green-500";
-  const statusDot =
-    status === "critical" ? "🔴" : status === "degrading" ? "🟡" : "🟢";
-
-  const fireIntensity = metrics?.load.running
-    ? Math.min(5, 1 + Math.floor((metrics.load.target ?? 0) / 800))
-    : 0;
+  const running = metrics?.load.running ?? false;
 
   const cacheTotal = (metrics?.cache.hits ?? 0) + (metrics?.cache.misses ?? 0);
   const cacheHitRate =
-    cacheTotal > 0
-      ? Math.round(((metrics?.cache.hits ?? 0) / cacheTotal) * 100)
-      : 0;
+    cacheTotal > 0 ? Math.round(((metrics?.cache.hits ?? 0) / cacheTotal) * 100) : 0;
+
+  const tiles = [
+    { label: "Throughput", value: fmt(metrics?.requestsPerSec ?? 0), unit: "req/s", accent: running },
+    { label: "Avg latency", value: `${metrics?.avgLatency ?? 0}`, unit: "ms", warn: (metrics?.avgLatency ?? 0) > 200 },
+    { label: "P99 latency", value: `${metrics?.p99Latency ?? 0}`, unit: "ms", warn: (metrics?.p99Latency ?? 0) > 1000 },
+    { label: "Error rate", value: `${metrics?.errorRate ?? 0}`, unit: "%", warn: (metrics?.errorRate ?? 0) > 1 },
+    { label: "CPU", value: `${metrics?.cpuUsage ?? 0}`, unit: "%" },
+    { label: "Memory", value: `${metrics?.memoryUsage ?? 0}`, unit: "MB" },
+    { label: "Connections", value: `${metrics?.activeConnections ?? 0}`, unit: "" },
+    { label: "Total requests", value: fmt(metrics?.totalRequests ?? 0), unit: "" },
+  ];
 
   return (
-    <div className="min-h-screen bg-zinc-950 text-zinc-100 font-mono p-6">
-      <header className="flex items-center justify-between mb-6">
-        <div className="flex items-center gap-4">
-          <div
-            className={`flex h-11 w-11 items-center justify-center rounded-xl text-2xl transition-all duration-500 ${
-              fireIntensity > 0
-                ? "bg-gradient-to-br from-orange-500/30 to-red-600/20 ring-1 ring-orange-500/40 shadow-[0_0_24px_rgba(249,115,22,0.35)]"
-                : "bg-gradient-to-br from-zinc-800 to-zinc-900 ring-1 ring-zinc-700/60"
-            }`}
-          >
-            🔥
-          </div>
+    <div className="min-h-screen bg-[#0b0b0d] text-zinc-100">
+      <div className="mx-auto max-w-[1800px] px-6 py-6 xl:px-10">
+        {/* ---------- Header ---------- */}
+        <header className="mb-7 flex items-center justify-between">
           <div>
-            <h1 className="text-xl font-semibold tracking-tight text-zinc-50">
+            <h1 className="text-2xl font-bold tracking-tight text-zinc-50">
               API Load Simulator
             </h1>
-            <p className="text-xs text-zinc-500">
+            <p className="mt-1 text-sm text-zinc-500">
               Break it · measure it · fix it — system design by experiment
             </p>
           </div>
-        </div>
-        <div className="flex items-center gap-3 text-sm">
-          <span
-            className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs ${
-              connected
-                ? "border-green-500/30 bg-green-500/10 text-green-400"
-                : "border-red-500/30 bg-red-500/10 text-red-400"
-            }`}
-          >
+          <div className="flex items-center gap-2">
             <span
-              className={`h-1.5 w-1.5 rounded-full ${
-                connected ? "animate-pulse bg-green-400" : "bg-red-400"
+              className={`inline-flex items-center gap-2 rounded-md border px-2.5 py-1 text-[11px] font-medium tracking-wide ${
+                connected
+                  ? "border-emerald-500/20 bg-emerald-500/[0.06] text-emerald-400"
+                  : "border-red-500/20 bg-red-500/[0.06] text-red-400"
               }`}
-            />
-            {connected ? "LIVE" : "OFFLINE"}
-          </span>
-          <span
-            className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-semibold ${statusColor} ${
-              status === "critical"
-                ? "border-red-500/30 bg-red-500/10"
-                : status === "degrading"
-                  ? "border-yellow-500/30 bg-yellow-500/10"
-                  : "border-green-500/30 bg-green-500/10"
-            }`}
-          >
-            {statusDot} {status.toUpperCase()}
-          </span>
-        </div>
-      </header>
+            >
+              <span
+                className={`h-1.5 w-1.5 rounded-full ${
+                  connected ? "animate-pulse bg-emerald-400" : "bg-red-400"
+                }`}
+              />
+              {connected ? "LIVE" : "OFFLINE"}
+            </span>
+            <span
+              className={`inline-flex items-center gap-2 rounded-md border px-2.5 py-1 text-[11px] font-semibold uppercase tracking-wide ${
+                status === "critical"
+                  ? "border-red-500/20 bg-red-500/[0.06] text-red-400"
+                  : status === "degrading"
+                    ? "border-amber-500/20 bg-amber-500/[0.06] text-amber-400"
+                    : "border-emerald-500/20 bg-emerald-500/[0.06] text-emerald-400"
+              }`}
+            >
+              {status}
+            </span>
+          </div>
+        </header>
 
-      {/* Control panel */}
-      <section
-        className={`relative overflow-hidden rounded-2xl border p-5 mb-6 transition-colors duration-500 ${
-          metrics?.load.running
-            ? "border-orange-500/30 bg-gradient-to-br from-zinc-900 via-zinc-900 to-orange-950/20"
-            : "border-zinc-800 bg-zinc-900"
-        }`}
-      >
-        {/* subtle top accent line */}
-        <div
-          className={`absolute inset-x-0 top-0 h-px transition-opacity duration-500 ${
-            metrics?.load.running
-              ? "bg-gradient-to-r from-transparent via-orange-500/60 to-transparent opacity-100"
-              : "bg-gradient-to-r from-transparent via-zinc-700 to-transparent opacity-60"
-          }`}
-        />
-        <div className="flex flex-wrap items-center gap-x-5 gap-y-3">
-          <span className="text-xs font-medium uppercase tracking-[0.15em] text-zinc-500">
-            Load level
+        {/* ---------- Load control ---------- */}
+        <section className={`${panel} mb-5 flex flex-wrap items-center gap-x-6 gap-y-3 px-5 py-4`}>
+          <span className="text-[11px] font-medium uppercase tracking-[0.16em] text-zinc-600">
+            Load
           </span>
-          <div className="flex items-center gap-1.5 rounded-xl border border-zinc-800 bg-zinc-950/60 p-1">
+          <div className="flex items-center gap-1 rounded-lg border border-zinc-800 bg-[#0b0b0d] p-1">
             {LOAD_LEVELS.map((lvl) => (
               <button
                 key={lvl}
                 onClick={() => setTarget(lvl)}
-                className={`rounded-lg px-4 py-1.5 text-sm transition-all ${
+                className={`rounded-md px-3.5 py-1.5 text-sm transition-all ${
                   target === lvl
-                    ? "bg-orange-500/15 font-semibold text-orange-300 shadow-[inset_0_0_0_1px_rgba(249,115,22,0.35)]"
+                    ? "bg-zinc-800 font-semibold text-zinc-100"
                     : "text-zinc-500 hover:text-zinc-300"
                 }`}
               >
                 {lvl / 1000}k
-                <span className="ml-1 text-[10px] text-zinc-600">req/s</span>
               </button>
             ))}
-            <div className="mx-1 h-5 w-px bg-zinc-800" />
+            <div className="mx-0.5 h-5 w-px bg-zinc-800" />
             <input
               value={custom}
               onChange={(e) => {
                 const v = e.target.value.replace(/\D/g, "");
                 setCustom(v);
-                if (v !== "" && Number(v) >= 1) setTarget(Number(v)); // live-apply
+                if (v !== "" && Number(v) >= 1) setTarget(Number(v));
               }}
               onKeyDown={(e) => {
                 if (e.key === "Enter") applyCustom();
               }}
               placeholder="custom"
-              className={`w-20 rounded-lg border bg-transparent px-2.5 py-1.5 text-sm transition-colors focus:outline-none ${
-                custom !== "" && Number(custom) >= 1
-                  ? "border-orange-500/40 text-orange-300"
-                  : "border-transparent text-zinc-300 placeholder-zinc-600 focus:border-orange-500/40"
-              }`}
+              className="w-20 rounded-md border border-transparent bg-transparent px-2 py-1.5 text-sm text-zinc-300 placeholder-zinc-600 focus:border-zinc-600 focus:outline-none"
             />
           </div>
-          <span
-            className={`inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs transition-colors ${
-              metrics?.load.running
-                ? "border-orange-500/40 bg-orange-500/10 text-orange-300"
-                : "border-zinc-800 bg-zinc-950/60 text-zinc-500"
-            }`}
-          >
-            <span
-              className={`h-1.5 w-1.5 rounded-full ${
-                metrics?.load.running
-                  ? "animate-pulse bg-orange-400"
-                  : "bg-zinc-600"
-              }`}
-            />
-            firing at <span className="font-bold text-zinc-100">{fmt(target)}</span> req/s
+          <span className="font-mono text-xs text-zinc-500">
+            target <span className="font-semibold text-zinc-200">{fmt(target)}</span> req/s
           </span>
 
           <div className="flex-1" />
 
           <button
             onClick={() => startLoad(target)}
-            disabled={metrics?.load.running}
-            className="rounded-lg bg-gradient-to-b from-orange-500 to-orange-600 px-7 py-2.5 text-sm font-bold tracking-wide text-white shadow-lg shadow-orange-950/50 transition-all hover:from-orange-400 hover:to-orange-500 disabled:cursor-not-allowed disabled:opacity-40"
-            style={{
-              transform: `scale(${1 + fireIntensity * 0.03})`,
-              boxShadow:
-                fireIntensity > 0
-                  ? `0 0 ${fireIntensity * 10}px rgba(249,115,22,0.4), 0 10px 20px -8px rgba(0,0,0,0.6)`
-                  : "0 10px 20px -8px rgba(0,0,0,0.6)",
-            }}
+            disabled={running}
+            className={`rounded-lg px-6 py-2 text-sm font-semibold transition-all disabled:cursor-not-allowed disabled:opacity-40 ${
+              running
+                ? "bg-zinc-800 text-zinc-500"
+                : "bg-orange-600 text-white hover:bg-orange-500"
+            }`}
           >
-            ▶ START LOAD
+            {running ? "Running" : "Start load"}
           </button>
           <button
             onClick={stopLoad}
-            disabled={!metrics?.load.running}
-            className="rounded-lg border border-zinc-700 bg-zinc-800/80 px-6 py-2.5 text-sm font-bold tracking-wide text-zinc-300 transition-all hover:border-zinc-500 hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-40"
+            disabled={!running}
+            className="rounded-lg border border-zinc-700/70 px-5 py-2 text-sm font-medium text-zinc-300 transition-colors hover:border-zinc-500 hover:bg-zinc-800/50 disabled:cursor-not-allowed disabled:opacity-40"
           >
-            ■ STOP
+            Stop
           </button>
-        </div>
-      </section>
+        </section>
 
-      {/* Metric tiles */}
-      <section className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
-        {[
-          {
-            label: "Target",
-            value: metrics?.load.running ? `${fmt(metrics.load.target)}/s` : "—",
-          },
-          { label: "Actual req/s", value: fmt(metrics?.requestsPerSec ?? 0) },
-          {
-            label: "Avg latency",
-            value: `${metrics?.avgLatency ?? 0} ms`,
-            warn: (metrics?.avgLatency ?? 0) > 200,
-          },
-          {
-            label: "P99 latency",
-            value: `${metrics?.p99Latency ?? 0} ms`,
-            warn: (metrics?.p99Latency ?? 0) > 1000,
-          },
-          {
-            label: "Error rate",
-            value: `${metrics?.errorRate ?? 0}%`,
-            warn: (metrics?.errorRate ?? 0) > 1,
-          },
-          { label: "CPU", value: `${metrics?.cpuUsage ?? 0}%` },
-          { label: "Memory", value: `${metrics?.memoryUsage ?? 0} MB` },
-          { label: "Total reqs", value: fmt(metrics?.totalRequests ?? 0) },
-        ].map((tile) => (
-          <div
-            key={tile.label}
-            className="rounded-xl border border-zinc-800 bg-zinc-900 p-4"
-          >
-            <div className="text-xs text-zinc-500 mb-1">{tile.label}</div>
-            <div
-              className={`text-xl font-bold ${
-                tile.warn ? "text-red-400" : "text-zinc-100"
-              }`}
-            >
-              {tile.value}
+        {/* ---------- Metric tiles ---------- */}
+        <section className="mb-5 grid grid-cols-2 gap-3 md:grid-cols-4 xl:grid-cols-8">
+          {tiles.map((tile) => (
+            <div key={tile.label} className={`${panel} px-4 py-3.5`}>
+              <div className="text-[11px] font-semibold uppercase tracking-[0.1em] text-zinc-400">
+                {tile.label}
+              </div>
+              <div className="mt-1.5 flex items-baseline gap-1">
+                <span
+                  className={`text-xl font-semibold tabular-nums ${
+                    tile.warn
+                      ? "text-red-400"
+                      : tile.accent
+                        ? "text-orange-300"
+                        : "text-zinc-100"
+                  }`}
+                >
+                  {tile.value}
+                </span>
+                {tile.unit && <span className="text-[11px] text-zinc-600">{tile.unit}</span>}
+              </div>
             </div>
+          ))}
+        </section>
+
+        {/* ---------- Fixes: 2x2 grid ---------- */}
+        <section className="mb-5 grid grid-cols-1 gap-3 md:grid-cols-2">
+          <FixCard
+            name="Database Indexing"
+            oneLinerOn={
+              metrics?.db.usingIndex
+                ? `index seek · ${metrics?.db.avgQueryMs ?? 0} ms avg query`
+                : "on — creating index…"
+            }
+            oneLinerOff={`full table scan of 100k rows · ${metrics?.db.avgQueryMs ?? 0} ms avg query`}
+            on={metrics?.db.indexEnabled ?? false}
+            onToggle={toggleIndex}
+          />
+          <FixCard
+            name="Redis Caching"
+            oneLinerOn={`${cacheHitRate}% hit rate · only misses reach the DB`}
+            oneLinerOff="every request queries the database"
+            on={metrics?.cache.enabled ?? false}
+            onToggle={toggleCache}
+          />
+          <FixCard
+            name="Connection Pooling"
+            oneLinerOn="20 pooled connections, reused across requests"
+            oneLinerOff="a fresh DB connection for every single request"
+            on={metrics?.pool.enabled ?? false}
+            onToggle={togglePool}
+          />
+          <FixCard
+            name="Load Balancing"
+            oneLinerOn={`${metrics?.cluster.workers ?? 4} instances across CPU cores · round-robin`}
+            oneLinerOff="single API instance pinned to one CPU core"
+            on={metrics?.cluster.enabled ?? false}
+            onToggle={toggleCluster}
+          />
+        </section>
+
+        {/* ---------- Charts ---------- */}
+        <section className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4">
+          <div className={`${panel} p-4`}>
+            <h2 className="mb-3 text-[11px] font-semibold uppercase tracking-[0.1em] text-zinc-400">
+              Throughput
+            </h2>
+            <ResponsiveContainer width="100%" height={170}>
+              <AreaChart data={points}>
+                <defs>
+                  <linearGradient id="rpsFill" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor="#f97316" stopOpacity={0.2} />
+                    <stop offset="100%" stopColor="#f97316" stopOpacity={0} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid stroke="#1a1a1d" vertical={false} />
+                <XAxis dataKey="t" hide />
+                <YAxis stroke="#3f3f46" width={44} fontSize={10} tickLine={false} axisLine={false} />
+                <Tooltip {...chartTooltip} />
+                <Area type="monotone" dataKey="rps" stroke="#f97316" strokeWidth={1.5} fill="url(#rpsFill)" dot={false} />
+              </AreaChart>
+            </ResponsiveContainer>
           </div>
-        ))}
-      </section>
 
-      {/* Phase 3: Database indexing panel */}
-      <section className="rounded-xl border border-zinc-800 bg-zinc-900 p-5 mb-6">
-        <div className="flex flex-wrap items-center gap-4 mb-4">
-          <h2 className="text-sm font-semibold tracking-wide text-zinc-200">
-            Fix #1 — Database Indexing
-          </h2>
-          <span
-            className={`text-xs px-2.5 py-1 rounded-full border font-medium ${
-              metrics?.db.indexEnabled
-                ? "border-green-500/30 bg-green-500/10 text-green-400"
-                : "border-zinc-700 bg-zinc-800/60 text-zinc-400"
-            }`}
-          >
-            {metrics?.db.indexEnabled ? "✅ INDEX ON" : "⬜ INDEX OFF · full table scan"}
-          </span>
-          <div className="flex gap-2">
-            <button
-              onClick={() => toggleIndex(false)}
-              className={`px-3 py-1 rounded text-xs ${
-                !metrics?.db.indexEnabled
-                  ? "bg-zinc-700 text-zinc-200"
-                  : "border border-zinc-700 text-zinc-500 hover:border-zinc-500"
-              }`}
-            >
-              index OFF
-            </button>
-            <button
-              onClick={() => toggleIndex(true)}
-              className={`px-3 py-1 rounded text-xs ${
-                metrics?.db.indexEnabled
-                  ? "bg-green-600 text-white"
-                  : "border border-green-700 text-green-400 hover:border-green-500"
-              }`}
-            >
-              index ON
-            </button>
+          <div className={`${panel} p-4`}>
+            <h2 className="mb-3 text-[11px] font-semibold uppercase tracking-[0.1em] text-zinc-400">
+              Latency · ms
+            </h2>
+            <ResponsiveContainer width="100%" height={170}>
+              <LineChart data={points}>
+                <CartesianGrid stroke="#1a1a1d" vertical={false} />
+                <XAxis dataKey="t" hide />
+                <YAxis stroke="#3f3f46" width={44} fontSize={10} tickLine={false} axisLine={false} />
+                <Tooltip {...chartTooltip} />
+                <Line type="monotone" dataKey="latency" stroke="#38bdf8" strokeWidth={1.5} dot={false} />
+                <Line type="monotone" dataKey="p99" stroke="#f87171" strokeWidth={1.5} dot={false} strokeDasharray="4 3" />
+              </LineChart>
+            </ResponsiveContainer>
           </div>
-          <div className="flex-1" />
-          <button
-            onClick={runBenchmark}
-            disabled={benchRunning || metrics?.load.running}
-            className="rounded-lg bg-gradient-to-b from-sky-500 to-sky-600 px-4 py-1.5 text-sm font-bold text-white shadow-md shadow-sky-950/40 transition-all hover:from-sky-400 hover:to-sky-500 disabled:cursor-not-allowed disabled:opacity-40"
-          >
-            {benchRunning ? "⏳ Running before/after (~1 min)..." : "▶ Run Before/After Benchmark"}
-          </button>
-        </div>
 
-        <div className="text-xs text-zinc-500 mb-3 font-mono">
-          Query plan: {metrics?.db.detail ?? "—"} · avg query: {metrics?.db.avgQueryMs ?? 0} ms ·{" "}
-          {metrics?.db.queriesPerSec ?? 0} queries/s
-        </div>
-
-        {bench.before && bench.after && (
-          <table className="w-full text-xs">
-            <thead>
-              <tr className="text-zinc-500 border-b border-zinc-800">
-                <th className="text-left py-1.5">Load</th>
-                <th className="text-right py-1.5">Before (scan) latency</th>
-                <th className="text-right py-1.5">After (index) latency</th>
-                <th className="text-right py-1.5">Improvement</th>
-                <th className="text-right py-1.5">Before rps</th>
-                <th className="text-right py-1.5">After rps</th>
-              </tr>
-            </thead>
-            <tbody>
-              {bench.before.map((b, i) => {
-                const a = bench.after?.[i];
-                if (!a) return null;
-                const improvement =
-                  b.avgLatency > 0
-                    ? Math.round((1 - a.avgLatency / b.avgLatency) * 100)
-                    : 0;
-                return (
-                  <tr key={b.targetRps} className="border-b border-zinc-800/50">
-                    <td className="py-1.5 text-zinc-300">{b.targetRps}/s</td>
-                    <td className="py-1.5 text-right text-red-400">{b.avgLatency.toFixed(0)} ms</td>
-                    <td className="py-1.5 text-right text-green-400">{a.avgLatency.toFixed(0)} ms</td>
-                    <td className="py-1.5 text-right font-bold text-sky-400">{improvement}% ↓</td>
-                    <td className="py-1.5 text-right text-zinc-500">{b.achievedRps}</td>
-                    <td className="py-1.5 text-right text-zinc-300">{a.achievedRps}</td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        )}
-      </section>
-
-      {/* Phase 4: Redis caching panel */}
-      <section className="rounded-xl border border-zinc-800 bg-zinc-900 p-5 mb-6">
-        <div className="flex flex-wrap items-center gap-4 mb-4">
-          <h2 className="text-sm font-semibold tracking-wide text-zinc-200">
-            Fix #2 — Redis Caching (5-min TTL)
-          </h2>
-          <span
-            className={`text-xs px-2.5 py-1 rounded-full border font-medium ${
-              metrics?.cache.enabled
-                ? "border-green-500/30 bg-green-500/10 text-green-400"
-                : "border-zinc-700 bg-zinc-800/60 text-zinc-400"
-            }`}
-          >
-            {metrics?.cache.enabled ? "✅ CACHE ON" : "⬜ CACHE OFF · every request hits the DB"}
-          </span>
-          <div className="flex gap-2">
-            <button
-              onClick={() => toggleCache(false)}
-              className={`px-3 py-1 rounded text-xs ${
-                !metrics?.cache.enabled
-                  ? "bg-zinc-700 text-zinc-200"
-                  : "border border-zinc-700 text-zinc-500 hover:border-zinc-500"
-              }`}
-            >
-              cache OFF
-            </button>
-            <button
-              onClick={() => toggleCache(true)}
-              className={`px-3 py-1 rounded text-xs ${
-                metrics?.cache.enabled
-                  ? "bg-green-600 text-white"
-                  : "border border-green-700 text-green-400 hover:border-green-500"
-              }`}
-            >
-              cache ON
-            </button>
+          <div className={`${panel} p-4`}>
+            <h2 className="mb-3 text-[11px] font-semibold uppercase tracking-[0.1em] text-zinc-400">
+              Errors · %
+            </h2>
+            <ResponsiveContainer width="100%" height={170}>
+              <AreaChart data={points}>
+                <defs>
+                  <linearGradient id="errFill" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor="#ef4444" stopOpacity={0.2} />
+                    <stop offset="100%" stopColor="#ef4444" stopOpacity={0} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid stroke="#1a1a1d" vertical={false} />
+                <XAxis dataKey="t" hide />
+                <YAxis stroke="#3f3f46" width={44} fontSize={10} tickLine={false} axisLine={false} />
+                <Tooltip {...chartTooltip} />
+                <Area type="monotone" dataKey="errors" stroke="#ef4444" strokeWidth={1.5} fill="url(#errFill)" dot={false} />
+              </AreaChart>
+            </ResponsiveContainer>
           </div>
-          <div className="flex-1" />
-          <button
-            onClick={runPhase4Benchmark}
-            disabled={bench4Running || metrics?.load.running}
-            className="rounded-lg bg-gradient-to-b from-sky-500 to-sky-600 px-4 py-1.5 text-sm font-bold text-white shadow-md shadow-sky-950/40 transition-all hover:from-sky-400 hover:to-sky-500 disabled:cursor-not-allowed disabled:opacity-40"
-          >
-            {bench4Running ? "⏳ Running before/after (~2 min)..." : "▶ Run Before/After Benchmark"}
-          </button>
-        </div>
 
-        <div className="text-xs text-zinc-500 mb-3 font-mono">
-          Hit rate: <span className="text-zinc-300 font-bold">{cacheHitRate}%</span> ·{" "}
-          {metrics?.cache.hits ?? 0} hits · {metrics?.cache.misses ?? 0} misses · DB queries/s:{" "}
-          <span className="text-zinc-300">{metrics?.db.queriesPerSec ?? 0}</span>
-        </div>
+          <div className={`${panel} p-4`}>
+            <h2 className="mb-3 text-[11px] font-semibold uppercase tracking-[0.1em] text-zinc-400">
+              CPU · %
+            </h2>
+            <ResponsiveContainer width="100%" height={170}>
+              <AreaChart data={points}>
+                <defs>
+                  <linearGradient id="cpuFill" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor="#84cc16" stopOpacity={0.2} />
+                    <stop offset="100%" stopColor="#84cc16" stopOpacity={0} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid stroke="#1a1a1d" vertical={false} />
+                <XAxis dataKey="t" hide />
+                <YAxis stroke="#3f3f46" width={44} fontSize={10} tickLine={false} axisLine={false} domain={[0, 100]} />
+                <Tooltip {...chartTooltip} />
+                <Area type="monotone" dataKey="cpu" stroke="#84cc16" strokeWidth={1.5} fill="url(#cpuFill)" dot={false} />
+              </AreaChart>
+            </ResponsiveContainer>
+          </div>
+        </section>
 
-        {bench4.before && bench4.after && (
-          <table className="w-full text-xs">
-            <thead>
-              <tr className="text-zinc-500 border-b border-zinc-800">
-                <th className="text-left py-1.5">Load</th>
-                <th className="text-right py-1.5">Before (no cache) latency</th>
-                <th className="text-right py-1.5">After (Redis) latency</th>
-                <th className="text-right py-1.5">Improvement</th>
-                <th className="text-right py-1.5">Before rps</th>
-                <th className="text-right py-1.5">After rps</th>
-              </tr>
-            </thead>
-            <tbody>
-              {bench4.before.map((b, i) => {
-                const a = bench4.after?.[i];
-                if (!a) return null;
-                const improvement =
-                  b.avgLatency > 0
-                    ? Math.round((1 - a.avgLatency / b.avgLatency) * 100)
-                    : 0;
-                return (
-                  <tr key={b.targetRps} className="border-b border-zinc-800/50">
-                    <td className="py-1.5 text-zinc-300">{b.targetRps}/s</td>
-                    <td className="py-1.5 text-right text-red-400">{b.avgLatency.toFixed(0)} ms</td>
-                    <td className="py-1.5 text-right text-green-400">{a.avgLatency.toFixed(0)} ms</td>
-                    <td className="py-1.5 text-right font-bold text-sky-400">{improvement}% ↓</td>
-                    <td className="py-1.5 text-right text-zinc-500">{b.achievedRps}</td>
-                    <td className="py-1.5 text-right text-zinc-300">{a.achievedRps}</td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        )}
-      </section>
-
-      {/* Charts */}
-      <section className="grid md:grid-cols-2 gap-6">
-        <div className="rounded-xl border border-zinc-800 bg-zinc-900 p-4">
-          <h2 className="text-sm text-zinc-400 mb-3">
-            Requests/sec (last ~60s)
-          </h2>
-          <ResponsiveContainer width="100%" height={220}>
-            <LineChart data={points}>
-              <CartesianGrid stroke="#27272a" />
-              <XAxis dataKey="t" hide />
-              <YAxis stroke="#71717a" width={60} />
-              <Tooltip
-                contentStyle={{ background: "#18181b", border: "#27272a" }}
-                labelFormatter={() => ""}
-              />
-              <Line
-                type="monotone"
-                dataKey="rps"
-                stroke="#f97316"
-                dot={false}
-                strokeWidth={2}
-              />
-            </LineChart>
-          </ResponsiveContainer>
-        </div>
-
-        <div className="rounded-xl border border-zinc-800 bg-zinc-900 p-4">
-          <h2 className="text-sm text-zinc-400 mb-3">Latency (ms)</h2>
-          <ResponsiveContainer width="100%" height={220}>
-            <LineChart data={points}>
-              <CartesianGrid stroke="#27272a" />
-              <XAxis dataKey="t" hide />
-              <YAxis stroke="#71717a" width={60} />
-              <Tooltip
-                contentStyle={{ background: "#18181b", border: "#27272a" }}
-                labelFormatter={() => ""}
-              />
-              <Legend />
-              <Line
-                type="monotone"
-                dataKey="latency"
-                name="avg"
-                stroke="#38bdf8"
-                dot={false}
-              />
-              <Line
-                type="monotone"
-                dataKey="p99"
-                name="p99"
-                stroke="#ef4444"
-                dot={false}
-              />
-            </LineChart>
-          </ResponsiveContainer>
-        </div>
-
-        <div className="rounded-xl border border-zinc-800 bg-zinc-900 p-4">
-          <h2 className="text-sm text-zinc-400 mb-3">Error rate (%)</h2>
-          <ResponsiveContainer width="100%" height={220}>
-            <LineChart data={points}>
-              <CartesianGrid stroke="#27272a" />
-              <XAxis dataKey="t" hide />
-              <YAxis stroke="#71717a" width={60} />
-              <Tooltip
-                contentStyle={{ background: "#18181b", border: "#27272a" }}
-                labelFormatter={() => ""}
-              />
-              <Line
-                type="monotone"
-                dataKey="errors"
-                stroke="#ef4444"
-                dot={false}
-                strokeWidth={2}
-              />
-            </LineChart>
-          </ResponsiveContainer>
-        </div>
-
-        <div className="rounded-xl border border-zinc-800 bg-zinc-900 p-4">
-          <h2 className="text-sm text-zinc-400 mb-3">CPU (%)</h2>
-          <ResponsiveContainer width="100%" height={220}>
-            <LineChart data={points}>
-              <CartesianGrid stroke="#27272a" />
-              <XAxis dataKey="t" hide />
-              <YAxis stroke="#71717a" width={60} domain={[0, 100]} />
-              <Tooltip
-                contentStyle={{ background: "#18181b", border: "#27272a" }}
-                labelFormatter={() => ""}
-              />
-              <Line
-                type="monotone"
-                dataKey="cpu"
-                stroke="#a3e635"
-                dot={false}
-                strokeWidth={2}
-              />
-            </LineChart>
-          </ResponsiveContainer>
-        </div>
-      </section>
-
-      <footer className="mt-8 text-xs text-zinc-600">
-        Phase 4 — Redis caching on top of the indexed query. Cache ON + index
-        ON is the current best config: most requests never touch the DB.
-        Toggle each fix and benchmark to see the stack effect.
-      </footer>
+        <footer className="mt-5 rounded-xl border border-zinc-800/70 bg-[#111113] px-5 py-3.5 text-xs text-zinc-500">
+          <span className="font-medium text-zinc-400">Tip:</span> flip an
+          optimization off under load and watch the metrics degrade in real
+          time. Flip it back on and watch them recover.
+        </footer>
+      </div>
     </div>
   );
 }

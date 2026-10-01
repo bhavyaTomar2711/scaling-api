@@ -6,6 +6,8 @@ const DATA_DIR = path.join(process.cwd(), "data");
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
 const db = new Database(path.join(DATA_DIR, "app.db"));
+db.pragma("journal_mode = WAL");
+db.pragma("busy_timeout = 5000");
 
 // Deliberately unoptimized for Phase 1:
 // - No index on the lookup column we filter by (queries will full-scan)
@@ -20,10 +22,9 @@ db.exec(`
   );
 `);
 
-// NOTE: no index on email by default — GET /users/:id does a full table scan
-// on purpose (Phase 3 adds the index and we compare before/after).
-
-let indexEnabled = false;
+// Check if index already exists on startup
+const hasIndex = db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_users_lower_email'").get();
+let indexEnabled = Boolean(hasIndex);
 
 // Phase 3: toggle the covering index for the LOWER(email) lookup.
 // With expression index: index seek (~0.01ms). Without: full scan of 10k rows.

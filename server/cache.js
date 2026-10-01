@@ -1,5 +1,4 @@
 import Redis from "ioredis";
-import { isIndexEnabled } from "./db.js";
 
 // Phase 4: Caching layer with a real Redis server (redis-bin/redis-server.exe
 // on localhost:6379). Caches user lookups for 5 minutes.
@@ -139,7 +138,7 @@ export async function getCacheInfo() {
 // Cached lookup wrapper: returns { user, cacheHit }
 export async function getUserCached(id, dbLookup) {
   if (!cacheState.enabled) {
-    const user = dbLookup();
+    const user = await dbLookup(); // dbLookup is async (queryUser) — must await
     return { user, cacheHit: false };
   }
   const cached = await cacheGetUser(id);
@@ -148,7 +147,7 @@ export async function getUserCached(id, dbLookup) {
     return { user: cached, cacheHit: true };
   }
   recordCacheMiss();
-  const user = dbLookup();
+  const user = await dbLookup(); // must await here too
   if (user) await cacheSetUser(id, user);
   return { user, cacheHit: false };
 }

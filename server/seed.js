@@ -40,28 +40,13 @@ export function getAndResetQueryStats() {
   return { avgQueryMs: Math.round(avgMs * 1000) / 1000, queriesPerSec: qps };
 }
 
-export function getUserById(id) {
-  // Intentionally "dumb" query for Phase 1 baseline:
-  // - SELECT * pulls the bulky payload column
-  // - WHERE on a non-indexed lowercase comparison forces a full table scan
-  // Phase 3: creating an expression index on LOWER(email) turns this exact
-  // same query into an index seek — no code change needed, that's the point.
+// Uncached lookup — the cache-miss / pool-query path. Query timing is
+// measured here for the dashboard's avg-query metric.
+export function lookupUserRaw(id) {
   const start = process.hrtime.bigint();
   const row = getUserStmt.get(`${id}@example.com`);
   queryTimeAccumulatorNs += process.hrtime.bigint() - start;
   queryCount++;
-  if (!row) return null;
-  return {
-    id: row.id,
-    name: row.name,
-    email: row.email,
-    createdAt: row.created_at,
-  };
-}
-
-// Uncached lookup used as the cache-miss path (skips query timing dedup)
-export function lookupUserRaw(id) {
-  const row = getUserStmt.get(`${id}@example.com`);
   if (!row) return null;
   return {
     id: row.id,

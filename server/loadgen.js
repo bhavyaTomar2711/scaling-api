@@ -72,7 +72,7 @@ export function getLoadStats() {
   };
 }
 
-export function startLoad(targetRps, port) {
+export function startLoad(targetRps, port, statsPort) {
   if (isRunning()) return false;
   currentTarget = targetRps;
   startedAt = Date.now();
@@ -87,7 +87,7 @@ export function startLoad(targetRps, port) {
         path.join(__dirname, "loadgen-child.js"),
         String(perWorker),
         String(port),
-        String(port),
+        String(statsPort || port),
         String(i),
       ],
       { stdio: ["ignore", "ignore", "pipe"], detached: false }
